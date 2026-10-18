@@ -3,239 +3,106 @@ const http = require('http');
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Dark Gramm Server works!');
+  res.end('Dark Horror Online Server');
 });
 
 const wss = new WebSocket.Server({ server });
 
-// Хранилище игроков и игр
 let players = {};
-let coinflipQueue = [];
-let caseBattles = {};
+let monster = { x: 400, y: 400, target: null };
+
+// Стены: [x, y, width, height]
+const WALLS = [
+  // Внешние стены
+  {x: 0, y: 0, w: 800, h: 20}, {x: 0, y: 780, w: 800, h: 20},
+  {x: 0, y: 0, w: 20, h: 800}, {x: 780, y: 0, w: 20, h: 800},
+  // Внутренние стены (лабиринт)
+  {x: 200, y: 200, w: 20, h: 400}, {x: 400, y: 0, w: 20, h: 300},
+  {x: 600, y: 200, w: 20, h: 400}, {x: 200, y: 600, w: 400, h: 20},
+  {x: 400, y: 400, w: 200, h: 20}
+];
 
 wss.on('connection', (ws) => {
   ws.id = Math.random().toString(36).substring(2, 9);
-  console.log('Подключился игрок:', ws.id);
-
   ws.send(JSON.stringify({ type: 'welcome', id: ws.id }));
 
   ws.on('message', (message) => {
-    let data;
     try {
-      data = JSON.parse(message);
-    } catch (e) {
-      return;
-    }
+      const data = JSON.parse(message);
 
-    switch (data.type) {
-      case 'register':
-        players[ws.id] = {
-          id: ws.id,
-          nick: data.nick || 'Игрок',
-          avatar: data.avatar || '👤',
-          balance: data.balance || 0,
-          ws: ws
-        };
-        broadcastOnlineCount();
-        broadcastBattles();
-        broadcastLeaderboard();
-        break;
+      if (data.type === 'join') {
+        players[ws.id] = { id: ws.id, nick: data.nick, skin: data.skin || '👤', x: 50, y: 50, hp: 100, alive: true };
+        broadcast({ type: 'players_update', players: Object.values(players) });
+      }
 
-      case 'update_balance':
+      if (data.type === 'move') {
+        if (players[ws.id] && players[ws.id].alive) {
+          players[ws.id].x = data.x;
+          players[ws.id].y = data.y;
+          broadcast({ type: 'players_update', players: Object.values(players) });
+        }
+      }
+
+      if (data.type === 'chat') {
         if (players[ws.id]) {
-          players[ws.id].balance = data.balance;
-          broadcastLeaderboard();
+          broadcast({ type: 'chat', from: players[ws.id].nick, text: data.text });
         }
-        break;
-
-      case 'join_coinflip': {
-        if (!players[ws.id]) return;
-        if (players[ws.id].balance < data.bet) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Недостаточно монет' }));
-          return;
-        }
-
-        if (coinflipQueue.length > 0) {
-          const opponentId = coinflipQueue.shift();
-          const opponent = players[opponentId];
-          const challenger = players[ws.id];
-
-          if (opponent && challenger && opponent.ws.readyState === WebSocket.OPEN) {
-            const bet = Math.min(data.bet, opponent.balance);
-            if (opponent.balance < bet || challenger.balance < bet) {
-              ws.send(JSON.stringify({ type: 'error', message: 'У противника мало монет' }));
-              return;
-            }
-
-            opponent.balance -= bet;
-            challenger.balance -= bet;
-
-            const result = Math.random() < 0.5 ? 'heads' : 'tails';
-            const winnerId = result === 'heads' ? challenger.id : opponent.id;
-            const winner = result === 'heads' ? challenger : opponent;
-            winner.balance += bet * 2;
-
-            opponent.ws.send(JSON.stringify({
-              type: 'coinflip_result',
-              opponent: challenger.nick,
-              bet: bet,
-              result: result,
-              win: winner.id === opponent.id,
-              yourBalance: opponent.balance,
-              enemyBalance: challenger.balance
-            }));
-
-            challenger.ws.send(JSON.stringify({
-              type: 'coinflip_result',
-              opponent: opponent.nick,
-              bet: bet,
-              result: result,
-              win: winner.id === challenger.id,
-              yourBalance: challenger.balance,
-              enemyBalance: opponent.balance
-            }));
-
-            broadcastLeaderboard();
-          } else {
-            coinflipQueue.push(ws.id);
-            ws.send(JSON.stringify({ type: 'coinflip_wait' }));
-          }
-        } else {
-          coinflipQueue.push(ws.id);
-          ws.send(JSON.stringify({ type: 'coinflip_wait' }));
-        }
-        break;
       }
 
-      case 'create_battle': {
-        if (!players[ws.id]) return;
-        const battleId = 'b_' + Date.now();
-        caseBattles[battleId] = {
-          id: battleId,
-          host: ws.id,
-          hostNick: players[ws.id].nick,
-          hostAvatar: players[ws.id].avatar,
-          cases: data.cases,
-          price: data.price,
-          status: 'waiting',
-          players: [ws.id]
-        };
-        broadcastBattles();
-        break;
-      }
-
-      case 'join_battle': {
-        const battle = caseBattles[data.battleId];
-        if (!battle || battle.status !== 'waiting') return;
-        if (battle.host === ws.id) return;
-        if (!players[ws.id] || !players[battle.host]) return;
-
-        const host = players[battle.host];
-        const guest = players[ws.id];
-
-        if (host.balance < battle.price || guest.balance < battle.price) {
-          ws.send(JSON.stringify({ type: 'error', message: 'У кого-то не хватает монет' }));
-          return;
+      if (data.type === 'kill') {
+        if (players[ws.id]) {
+          players[ws.id].alive = false;
+          broadcast({ type: 'system', text: `💀 Монстр убил ${players[ws.id].nick}!` });
+          broadcast({ type: 'players_update', players: Object.values(players) });
         }
-
-        battle.status = 'playing';
-        host.balance -= battle.price;
-        guest.balance -= battle.price;
-
-        const hostScore = Math.floor(Math.random() * 5000) + battle.price;
-        const guestScore = Math.floor(Math.random() * 5000) + battle.price;
-
-        let winnerId = hostScore >= guestScore ? host.id : guest.id;
-        const winner = winnerId === host.id ? host : guest;
-        winner.balance += battle.price * 2;
-
-        setTimeout(() => {
-          if (host.ws.readyState === WebSocket.OPEN) {
-            host.ws.send(JSON.stringify({
-              type: 'battle_result',
-              you: hostScore,
-              enemy: guestScore,
-              enemyNick: guest.nick,
-              win: winnerId === host.id,
-              winAmount: battle.price * 2
-            }));
-          }
-          if (guest.ws.readyState === WebSocket.OPEN) {
-            guest.ws.send(JSON.stringify({
-              type: 'battle_result',
-              you: guestScore,
-              enemy: hostScore,
-              enemyNick: host.nick,
-              win: winnerId === guest.id,
-              winAmount: battle.price * 2
-            }));
-          }
-
-          delete caseBattles[battle.id];
-          broadcastBattles();
-          broadcastLeaderboard();
-        }, 4000);
-
-        broadcastBattles();
-        break;
       }
-
-      case 'leave_queue':
-        coinflipQueue = coinflipQueue.filter(id => id !== ws.id);
-        break;
-    }
+    } catch (e) {}
   });
 
   ws.on('close', () => {
-    console.log('Отключился игрок:', ws.id);
     delete players[ws.id];
-    coinflipQueue = coinflipQueue.filter(id => id !== ws.id);
-
-    // Удаляем батлы этого игрока
-    for (const key in caseBattles) {
-      if (caseBattles[key].host === ws.id && caseBattles[key].status === 'waiting') {
-        delete caseBattles[key];
-      }
-    }
-
-    broadcastOnlineCount();
-    broadcastBattles();
-    broadcastLeaderboard();
+    broadcast({ type: 'players_update', players: Object.values(players) });
   });
 });
 
-function broadcastOnlineCount() {
-  const count = Object.keys(players).length;
-  sendToAll({ type: 'online_count', count });
-}
+// Движение монстра
+setInterval(() => {
+  if (Object.keys(players).length > 0) {
+    const alivePlayers = Object.values(players).filter(p => p.alive);
+    if (alivePlayers.length > 0) {
+      // Ищем ближайшего игрока
+      let closest = alivePlayers[0];
+      let minDist = Infinity;
+      alivePlayers.forEach(p => {
+        const dist = Math.hypot(p.x - monster.x, p.y - monster.y);
+        if (dist < minDist) { minDist = dist; closest = p; }
+      });
 
-function broadcastBattles() {
-  const list = Object.values(caseBattles).filter(b => b.status === 'waiting').map(b => ({
-    id: b.id,
-    hostNick: b.hostNick,
-    hostAvatar: b.hostAvatar,
-    price: b.price,
-    casesCount: b.cases.length
-  }));
-  sendToAll({ type: 'battles_list', battles: list });
-}
+      // Двигаемся к нему (скорость 2)
+      const dx = closest.x - monster.x;
+      const dy = closest.y - monster.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 0) {
+        monster.x += (dx / len) * 1.5;
+        monster.y += (dy / len) * 1.5;
+      }
+      
+      broadcast({ type: 'monster_update', x: monster.x, y: monster.y });
 
-function broadcastLeaderboard() {
-  const list = Object.values(players)
-    .map(p => ({ nick: p.nick, avatar: p.avatar, balance: p.balance }))
-    .sort((a, b) => b.balance - a.balance)
-    .slice(0, 10);
-  sendToAll({ type: 'leaderboard', list });
-}
+      // Если догнал — убивает
+      if (minDist < 20) {
+        closest.alive = false;
+        broadcast({ type: 'system', text: `💀 Монстр поймал ${closest.nick}!` });
+        broadcast({ type: 'players_update', players: Object.values(players) });
+      }
+    }
+  }
+}, 100);
 
-function sendToAll(obj) {
+function broadcast(obj) {
   const msg = JSON.stringify(obj);
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) c.send(msg);
-  });
+  wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
 }
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log('✅ Сервер запущен на порту ' + PORT);
-});
+server.listen(PORT, () => console.log('✅ Сервер запущен на ' + PORT));
