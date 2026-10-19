@@ -3,7 +3,7 @@ const http = require('http');
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Dark Gramm Online Server');
+  res.end('Dark Gramm Online Server is Running');
 });
 
 const wss = new WebSocket.Server({ server });
@@ -22,17 +22,28 @@ wss.on('connection', (ws) => {
 
     switch (data.type) {
       case 'register':
-        players[ws.id] = { id: ws.id, nick: data.nick, avatar: data.avatar, balance: data.balance || 0, ws: ws };
+        players[ws.id] = { 
+          id: ws.id, 
+          nick: data.nick, 
+          avatar: data.avatar, 
+          balance: data.balance || 0, 
+          ws: ws 
+        };
         broadcastOnlineCount();
         broadcastBattles();
-        broadcastLeaderboard();
+        broadcastPlayers(); // Отправляем обновленный список игроков
         break;
 
       case 'update_balance':
         if (players[ws.id]) {
           players[ws.id].balance = data.balance;
-          broadcastLeaderboard();
+          broadcastPlayers(); // Обновляем таблицу лидеров при изменении баланса
         }
+        break;
+
+      case 'get_players':
+        // Если клиент запрашивает список игроков (при открытии вкладки)
+        broadcastPlayers();
         break;
 
       case 'join_coinflip': {
@@ -70,7 +81,7 @@ wss.on('connection', (ws) => {
               type: 'coinflip_result', opponent: opponent.nick, bet: bet, result: result,
               win: winner.id === challenger.id, yourBalance: challenger.balance, enemyBalance: opponent.balance
             }));
-            broadcastLeaderboard();
+            broadcastPlayers();
           } else {
             coinflipQueue.push(ws.id);
             ws.send(JSON.stringify({ type: 'coinflip_wait' }));
@@ -86,8 +97,14 @@ wss.on('connection', (ws) => {
         if (!players[ws.id]) return;
         const battleId = 'b_' + Date.now();
         caseBattles[battleId] = {
-          id: battleId, host: ws.id, hostNick: players[ws.id].nick, hostAvatar: players[ws.id].avatar,
-          cases: data.cases, price: data.price, status: 'waiting', players: [ws.id]
+          id: battleId, 
+          host: ws.id, 
+          hostNick: players[ws.id].nick, 
+          hostAvatar: players[ws.id].avatar,
+          price: data.price, 
+          caseCount: data.count || 1,
+          status: 'waiting', 
+          players: [ws.id]
         };
         broadcastBattles();
         break;
@@ -109,20 +126,52 @@ wss.on('connection', (ws) => {
         battle.status = 'playing';
         host.balance -= battle.price;
         guest.balance -= battle.price;
+        
+        // Отправляем сигнал, что батл начался (чтобы клиент запустил анимацию)
+        const startData = {
+          type: 'battle_start',
+          enemy: { nick: guest.nick, avatar: guest.avatar },
+          isHost: true
+        };
+        host.ws.send(JSON.stringify(startData));
+        
+        const startDataGuest = {
+          type: 'battle_start',
+          enemy: { nick: host.nick, avatar: host.avatar },
+          isHost: false
+        };
+        guest.ws.send(JSON.stringify(startDataGuest));
 
-        const hostScore = Math.floor(Math.random() * 5000) + battle.price;
-        const guestScore = Math.floor(Math.random() * 5000) + battle.price;
-        let winnerId = hostScore >= guestScore ? host.id : guest.id;
-        const winner = winnerId === host.id ? host : guest;
-        winner.balance += battle.price * 2;
-
+        // Ждем 3.5 секунды, пока крутятся рулетки, и отправляем результат
         setTimeout(() => {
-          if (host.ws.readyState === WebSocket.OPEN) host.ws.send(JSON.stringify({ type: 'battle_result', you: hostScore, enemy: guestScore, enemyNick: guest.nick, win: winnerId === host.id, winAmount: battle.price * 2 }));
-          if (guest.ws.readyState === WebSocket.OPEN) guest.ws.send(JSON.stringify({ type: 'battle_result', you: guestScore, enemy: hostScore, enemyNick: host.nick, win: winnerId === guest.id, winAmount: battle.price * 2 }));
+          const hostScore = Math.floor(Math.random() * 5000) + battle.price;
+          const guestScore = Math.floor(Math.random() * 5000) + battle.price;
+          let winnerId = hostScore >= guestScore ? host.id : guest.id;
+          const winner = winnerId === host.id ? host : guest;
+          winner.balance += battle.price * 2;
+
+          if (host.ws.readyState === WebSocket.OPEN) {
+            host.ws.send(JSON.stringify({ 
+              type: 'battle_result', 
+              myScore: hostScore, 
+              enemyScore: guestScore, 
+              win: winnerId === host.id 
+            }));
+          }
+          if (guest.ws.readyState === WebSocket.OPEN) {
+            guest.ws.send(JSON.stringify({ 
+              type: 'battle_result', 
+              myScore: guestScore, 
+              enemyScore: hostScore, 
+              win: winnerId === guest.id 
+            }));
+          }
+          
           delete caseBattles[battle.id];
           broadcastBattles();
-          broadcastLeaderboard();
+          broadcastPlayers();
         }, 4000);
+        
         broadcastBattles();
         break;
       }
@@ -133,29 +182,57 @@ wss.on('connection', (ws) => {
     delete players[ws.id];
     coinflipQueue = coinflipQueue.filter(id => id !== ws.id);
     for (const key in caseBattles) {
-      if (caseBattles[key].host === ws.id && caseBattles[key].status === 'waiting') delete caseBattles[key];
+      if (caseBattles[key].host === ws.id && caseBattles[key].status === 'waiting') {
+        delete caseBattles[key];
+      }
     }
     broadcastOnlineCount();
     broadcastBattles();
-    broadcastLeaderboard();
+    broadcastPlayers();
   });
 });
 
 function broadcastOnlineCount() {
   sendToAll({ type: 'online_count', count: Object.keys(players).length });
 }
+
 function broadcastBattles() {
-  const list = Object.values(caseBattles).filter(b => b.status === 'waiting').map(b => ({ id: b.id, hostNick: b.hostNick, hostAvatar: b.hostAvatar, price: b.price }));
+  const list = Object.values(caseBattles)
+    .filter(b => b.status === 'waiting')
+    .map(b => ({ 
+      id: b.id, 
+      hostNick: b.hostNick, 
+      hostAvatar: b.hostAvatar, 
+      price: b.price,
+      caseCount: b.caseCount
+    }));
   sendToAll({ type: 'battles_list', battles: list });
 }
-function broadcastLeaderboard() {
-  const list = Object.values(players).map(p => ({ nick: p.nick, avatar: p.avatar, balance: p.balance })).sort((a, b) => b.balance - a.balance).slice(0, 10);
-  sendToAll({ type: 'leaderboard', list });
+
+// ЭТА ФУНКЦИЯ ОТВЕЧАЕТ ЗА ТАБЛИЦУ ИГРОКОВ
+function broadcastPlayers() {
+  const list = Object.values(players)
+    .map(p => ({ 
+      id: p.id, 
+      nick: p.nick, 
+      avatar: p.avatar, 
+      balance: p.balance 
+    }))
+    .sort((a, b) => b.balance - a.balance); // Сортируем по балансу (богатые сверху)
+    
+  // Отправляем как players_list (для таблицы всех игроков)
+  sendToAll({ type: 'players_list', players: list });
+  
+  // Отправляем как leaderboard (для вкладки Топ-10)
+  sendToAll({ type: 'leaderboard', list: list.slice(0, 10) });
 }
+
 function sendToAll(obj) {
   const msg = JSON.stringify(obj);
-  wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+  wss.clients.forEach(c => { 
+    if (c.readyState === WebSocket.OPEN) c.send(msg); 
+  });
 }
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log('✅ Сервер запущен на ' + PORT));
+server.listen(PORT, () => console.log('✅ Сервер запущен на порту ' + PORT));
